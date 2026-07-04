@@ -1,0 +1,65 @@
+{
+  "name": "claude-code-the-button",
+  "displayName": "The Button — Claude Code Approvals",
+  "description": "Answer Claude Code permission prompts from inside VS Code, in the background — the cross-platform companion to The Button floating panel.",
+  "publisher": "Killeren",
+  "version": "0.1.0",
+  "license": "MIT",
+  "icon": "icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Killeren/the-button"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "main": "./extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "categories": [
+    "AI",
+    "Other"
+  ],
+  "keywords": [
+    "claude",
+    "claude-code",
+    "approvals",
+    "permissions",
+    "agent"
+  ],
+  "galleryBanner": {
+    "color": "#262624",
+    "theme": "dark"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "theButton.allow",
+        "title": "The Button: Allow Pending Claude Prompt"
+      },
+      {
+        "command": "theButton.deny",
+        "title": "The Button: Deny Pending Claude Prompt"
+      },
+      {
+        "command": "theButton.dismiss",
+        "title": "The Button: Dismiss Pending Claude Prompt"
+      },
+      {
+        "command": "theButton.installHooks",
+        "title": "The Button: Install Claude Code Hooks"
+      }
+    ],
+    "configuration": {
+      "title": "The Button",
+      "properties": {
+        "theButton.eventFile": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the event file written by hook.py. Leave empty to use ~/.claude/the_button/event.json."
+        }
+      }
+    }
+  }
+}
