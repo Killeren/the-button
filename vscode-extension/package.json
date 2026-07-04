@@ -1,6 +1,6 @@
 {
-  "name": "claude-code-the-button",
-  "displayName": "The Button — Claude Code Approvals",
+  "name": "the-button",
+  "displayName": "The Button — Agent Approvals",
   "description": "Answer Claude Code permission prompts from inside VS Code, in the background — the cross-platform companion to The Button floating panel.",
   "publisher": "Killeren",
   "version": "0.1.0",
@@ -22,11 +22,11 @@
     "Other"
   ],
   "keywords": [
-    "claude",
-    "claude-code",
     "approvals",
     "permissions",
-    "agent"
+    "agent",
+    "terminal",
+    "automation"
   ],
   "galleryBanner": {
     "color": "#262624",
