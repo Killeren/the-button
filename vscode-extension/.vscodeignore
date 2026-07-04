@@ -6,3 +6,5 @@ node_modules/**
 **/*.vsix
 **/*.map
 **/.DS_Store
+package.sh
+hook.py

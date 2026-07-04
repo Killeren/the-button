@@ -365,12 +365,13 @@ function ensureHook(hooks, event, kind) {
 }
 
 /**
- * Locate hook.py: the copy bundled inside the extension package first (that's
- * what Marketplace installs have), then walk up from __dirname (dev checkout
- * of the repo, where hook.py sits at the root).
+ * Locate the hook source: the copy bundled inside the extension package first
+ * (shipped as hook-py.txt — the Marketplace rejects packaged scripts; it is
+ * written out as hook.py on install), then walk up from __dirname (dev
+ * checkout of the repo, where hook.py sits at the root).
  */
 function findRepoHookPy() {
-  const bundled = path.join(__dirname, 'hook.py');
+  const bundled = path.join(__dirname, 'hook-py.txt');
   try {
     if (fs.statSync(bundled).isFile()) return bundled;
   } catch (_e) {

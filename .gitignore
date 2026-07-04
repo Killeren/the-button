@@ -2,6 +2,7 @@
 TheButton.app/
 *.vsix
 vscode-extension/hook.py
+vscode-extension/hook-py.txt
 
 .DS_Store
 __pycache__/
