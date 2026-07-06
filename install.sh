@@ -20,24 +20,37 @@ if os.path.exists(path):
 
 hooks = settings.setdefault("hooks", {})
 
-def ensure(event, kind):
+def ensure(event, kind, timeout=None):
     cmd = f'python3 "$HOME/.claude/the_button/hook.py" {kind}'
     entries = hooks.setdefault(event, [])
     for entry in entries:
         for h in entry.get("hooks", []):
             if "the_button/hook.py" in h.get("command", ""):
                 h["command"] = cmd
+                if timeout:
+                    h["timeout"] = timeout
+                else:
+                    h.pop("timeout", None)
                 return
-    entries.append({"hooks": [{"type": "command", "command": cmd}]})
+    hook = {"type": "command", "command": cmd}
+    if timeout:
+        hook["timeout"] = timeout
+    entries.append({"hooks": [hook]})
 
-ensure("PermissionRequest", "permreq")
+# permreq may block while the panel decides; the timeout must never kill it
+# mid-wait (hook.py's own decide window is 590s, safely inside).
+ensure("PermissionRequest", "permreq", 600)
 ensure("PreToolUse", "pretool")
 ensure("Notification", "notify")
 for event in ("PostToolUse", "PostToolUseFailure", "Stop", "UserPromptSubmit", "SessionEnd"):
     ensure(event, "clear")
 
-with open(path, "w") as f:
+# Atomic write: a truncated settings.json would break every Claude Code hook.
+import tempfile
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", suffix=".tmp")
+with os.fdopen(fd, "w") as f:
     json.dump(settings, f, indent=2)
+os.replace(tmp, path)
 print(f"Hooks installed in {path}")
 PY
 

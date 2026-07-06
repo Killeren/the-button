@@ -3,7 +3,7 @@
   "displayName": "The Button — Claude Code Approvals",
   "description": "Answer Claude Code permission prompts from inside VS Code, in the background — the cross-platform companion to The Button floating panel.",
   "publisher": "Killeren",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "license": "MIT",
   "icon": "icon.png",
   "repository": {
@@ -54,10 +54,15 @@
     "configuration": {
       "title": "The Button",
       "properties": {
+        "theButton.eventsDir": {
+          "type": "string",
+          "default": "",
+          "description": "Directory of per-prompt event files written by hook.py. Leave empty to use ~/.claude/the_button/events."
+        },
         "theButton.eventFile": {
           "type": "string",
           "default": "",
-          "description": "Path to the event file written by hook.py. Leave empty to use ~/.claude/the_button/event.json."
+          "description": "Legacy single event file (old hook.py). Leave empty to use ~/.claude/the_button/event.json."
         }
       }
     }

@@ -1,15 +1,22 @@
 'use strict';
 
-// The Button — Claude Code Approvals (VS Code companion).
+// The Button — Claude Code Approvals (VS Code companion), v0.2.
 //
-// Watches the event file written by hook.py (~/.claude/the_button/event.json)
-// and answers Claude Code permission prompts IN THE BACKGROUND via
-// terminal.sendText — no focus changes, no synthesized keystrokes.
+// Watches the per-prompt event files written by hook.py
+// (~/.claude/the_button/events/*.json) and answers Claude Code permission
+// prompts IN THE BACKGROUND:
 //
-// Semantics mirrored from the macOS floating app (Sources/main.swift):
-//   - Enter ("\r") confirms the highlighted (first/Yes) option; Esc declines.
-//   - One event file, last-write-wins; a handled ts must never re-fire.
-//   - Stale events (claude_pid no longer alive) are dropped.
+//   decide mode    the hook is blocked waiting on an answer file; we write
+//                  {"behavior":"allow"|"deny"} and the hook returns the
+//                  decision to Claude Code. No keystrokes, no terminal
+//                  targeting, works over ssh — any terminal, any platform.
+//   keystroke mode the dialog is already on screen (old hook.py, or the
+//                  decide window expired): terminal.sendText Enter/Esc into
+//                  the right integrated terminal, as v0.1 did.
+//
+// A 1s heartbeat file advertises this listener to hook.py; without any fresh
+// heartbeat the hook never blocks. Legacy single-file mode (event.json) is
+// kept for old hook.py installs.
 
 const vscode = require('vscode');
 const fs = require('fs');
@@ -17,40 +24,66 @@ const os = require('os');
 const path = require('path');
 
 const POLL_INTERVAL_MS = 300;
+const HEARTBEAT_MS = 1000;
 const DETAIL_MAX = 80;
 const ENTER = '\r';
 const ESCAPE = '\u001b';
+const LEGACY_KEY = '__legacy__';
 
-let statusItem = null; // vscode.StatusBarItem
-let watchedPath = null; // absolute path currently passed to fs.watchFile
-let lastHandledTs = 0; // ts of the last answered/dismissed event
-let lastNotifiedTs = 0; // ts of the last event we popped a notification for
-let pendingEvent = null; // current unanswered "permission" event, or null
+let statusItem = null;
+let pollTimer = null;
+let heartbeatTimer = null;
+let heartbeatPath = null;
+const pendingTimers = new Set(); // decide→keystroke fallback timers, cleared on deactivate
+
+/** filename -> { mtimeMs, ev, filePath } for events/ dir mode. */
+const fileState = new Map();
+/** filename -> ts of the event we last popped a notification for. */
+const notifiedTs = new Map();
+/** filename -> ts answered/dismissed locally; never act on it again. */
+const handledTs = new Map();
+let legacyMtimeMs = -1;
+let legacyEvent = null; // parsed event.json (legacy mode only)
 
 // ---------------------------------------------------------------------------
-// Event file
+// Paths & config
 // ---------------------------------------------------------------------------
 
-function defaultEventFile() {
-  return path.join(os.homedir(), '.claude', 'the_button', 'event.json');
+function expandHome(p) {
+  if (p === '~' || p.startsWith('~/') || p.startsWith('~\\')) {
+    return path.join(os.homedir(), p.slice(1));
+  }
+  return p;
 }
 
-function resolveEventFile() {
-  let configured = '';
+function configuredPath(key) {
   try {
-    configured = vscode.workspace.getConfiguration('theButton').get('eventFile', '');
+    const value = vscode.workspace.getConfiguration('theButton').get(key, '');
+    if (typeof value === 'string' && value.trim() !== '') return expandHome(value.trim());
   } catch (_e) {
-    /* configuration unavailable: fall through to default */
+    /* configuration unavailable */
   }
-  if (typeof configured === 'string' && configured.trim() !== '') {
-    let p = configured.trim();
-    if (p === '~' || p.startsWith('~/') || p.startsWith('~\\')) {
-      p = path.join(os.homedir(), p.slice(1));
-    }
-    return p;
-  }
-  return defaultEventFile();
+  return null;
 }
+
+function resolveEventsDir() {
+  return configuredPath('eventsDir')
+    || path.join(os.homedir(), '.claude', 'the_button', 'events');
+}
+
+function resolveLegacyEventFile() {
+  return configuredPath('eventFile')
+    || path.join(os.homedir(), '.claude', 'the_button', 'event.json');
+}
+
+/** hook.py's STATE_DIR: heartbeats and temp files live here. */
+function resolveStateDir() {
+  return path.dirname(resolveEventsDir());
+}
+
+// ---------------------------------------------------------------------------
+// Event files
+// ---------------------------------------------------------------------------
 
 /** Defensive read: returns a parsed event object or null, never throws. */
 function readEventFile(filePath) {
@@ -87,85 +120,189 @@ function truncate(text, max) {
   return s.length > max ? s.slice(0, max) + '…' : s;
 }
 
-// ---------------------------------------------------------------------------
-// Status bar
-// ---------------------------------------------------------------------------
-
-function showStatus(text, warning, tooltip) {
-  if (!statusItem) return;
-  statusItem.text = text;
-  statusItem.tooltip = tooltip || undefined;
-  statusItem.backgroundColor = warning
-    ? new vscode.ThemeColor('statusBarItem.warningBackground')
-    : undefined;
-  statusItem.show();
+function isDecide(ev) {
+  return ev && ev.mode === 'decide' && typeof ev.answer_path === 'string' && ev.answer_path;
 }
 
-function hideStatus() {
-  if (statusItem) statusItem.hide();
-}
-
-function markHandled(ts) {
-  if (ts) lastHandledTs = ts;
-  pendingEvent = null;
-  hideStatus();
+/** Atomic write next to the target so the blocked hook never sees a partial file. */
+function writeAnswer(answerPath, payload) {
+  const stateDir = resolveStateDir();
+  fs.mkdirSync(path.dirname(answerPath), { recursive: true });
+  const tmp = path.join(stateDir, '.vsext-' + process.pid + '-' + Date.now() + '.tmp');
+  fs.writeFileSync(tmp, JSON.stringify(payload));
+  fs.renameSync(tmp, answerPath);
 }
 
 // ---------------------------------------------------------------------------
-// Event dispatch
+// Heartbeat (tells hook.py a decide-capable listener is alive)
 // ---------------------------------------------------------------------------
 
-function handleEvent(ev) {
-  if (!ev) return;
-  const ts = eventTs(ev);
+function beat() {
+  try {
+    const stateDir = resolveStateDir();
+    fs.mkdirSync(stateDir, { recursive: true });
+    const target = path.join(stateDir, 'heartbeat-vscode.json');
+    const tmp = path.join(stateDir, '.hb-vscode-' + process.pid + '.tmp');
+    fs.writeFileSync(tmp, JSON.stringify({
+      caps: ['decide'],
+      ts: Date.now() / 1000, // hook.py compares against time.time() (seconds)
+      pid: process.pid,
+    }));
+    fs.renameSync(tmp, target);
+    heartbeatPath = target;
+  } catch (_e) {
+    /* state dir unwritable: decide mode simply stays off */
+  }
+}
 
-  if (ev.type === 'clear' || (ts !== 0 && ts === lastHandledTs)) {
-    pendingEvent = null;
-    hideStatus();
+function stopHeartbeat() {
+  if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+  if (heartbeatPath) {
+    try { fs.unlinkSync(heartbeatPath); } catch (_e) { /* already gone */ }
+    heartbeatPath = null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Scanning
+// ---------------------------------------------------------------------------
+
+function scan() {
+  const dir = resolveEventsDir();
+  let names = null;
+  try {
+    names = fs.readdirSync(dir).filter((n) => n.endsWith('.json'));
+  } catch (err) {
+    if (err && err.code === 'ENOENT') {
+      names = null; // dir truly absent: old hook.py — legacy single-file mode
+    } else {
+      return; // transient readdir error (EMFILE/EACCES): keep state, skip tick
+    }
+  }
+
+  if (names === null) {
+    fileState.clear();
+    scanLegacy();
+  } else {
+    legacyEvent = null;
+    legacyMtimeMs = -1;
+    const seen = new Set();
+    for (const name of names) {
+      const filePath = path.join(dir, name);
+      let st;
+      try { st = fs.statSync(filePath); } catch (_e) { continue; }
+      seen.add(name);
+      const prev = fileState.get(name);
+      if (prev && prev.mtimeMs === st.mtimeMs) continue;
+      fileState.set(name, { mtimeMs: st.mtimeMs, ev: readEventFile(filePath), filePath });
+    }
+    for (const name of [...fileState.keys()]) {
+      if (!seen.has(name)) {
+        fileState.delete(name);
+        notifiedTs.delete(name);
+        handledTs.delete(name);
+      }
+    }
+  }
+  updateUI();
+}
+
+function scanLegacy() {
+  const filePath = resolveLegacyEventFile();
+  let st;
+  try {
+    st = fs.statSync(filePath);
+  } catch (_e) {
+    legacyEvent = null;
+    legacyMtimeMs = -1; // reset so a delete+recreate with the same mtime re-reads
     return;
   }
+  if (st.mtimeMs === legacyMtimeMs) return;
+  legacyMtimeMs = st.mtimeMs;
+  const ev = readEventFile(filePath);
+  if (!ev || ev.type === 'clear') { legacyEvent = null; return; }
+  legacyEvent = ev;
+}
 
-  if (ev.type === 'permission') {
-    if (claudeIsDead(ev)) {
-      pendingEvent = null;
-      hideStatus();
-      return;
+/** Pending entries: [{ key, ev, filePath }] oldest-first, permissions only. */
+function pendingPermissions() {
+  const out = [];
+  if (legacyEvent) {
+    if (legacyEvent.type === 'permission'
+        && !claudeIsDead(legacyEvent)
+        && handledTs.get(LEGACY_KEY) !== eventTs(legacyEvent)) {
+      out.push({ key: LEGACY_KEY, ev: legacyEvent, filePath: resolveLegacyEventFile() });
     }
-    pendingEvent = ev;
-    const toolName = String(ev.tool_name || 'permission');
-    showStatus(
-      '$(bell) Claude: ' + toolName,
-      true,
-      truncate(ev.detail || ev.message, 200) || 'Claude Code is asking for permission'
-    );
-    if (ts !== lastNotifiedTs) {
-      lastNotifiedTs = ts;
-      showPermissionNotification(ev);
+    return out;
+  }
+  for (const [name, entry] of fileState) {
+    const ev = entry.ev;
+    if (!ev || ev.type !== 'permission') continue;
+    if (claudeIsDead(ev)) continue;
+    if (handledTs.get(name) === eventTs(ev)) continue;
+    out.push({ key: name, ev, filePath: entry.filePath });
+  }
+  out.sort((a, b) => eventTs(a.ev) - eventTs(b.ev));
+  return out;
+}
+
+function anyWaiting() {
+  if (legacyEvent) return legacyEvent.type === 'notify' && !claudeIsDead(legacyEvent);
+  for (const entry of fileState.values()) {
+    if (entry.ev && entry.ev.type === 'notify' && !claudeIsDead(entry.ev)) return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Status bar + notifications
+// ---------------------------------------------------------------------------
+
+function updateUI() {
+  const pending = pendingPermissions();
+
+  if (pending.length === 0) {
+    if (anyWaiting()) {
+      statusItem.text = '$(watch) Claude is waiting';
+      statusItem.tooltip = 'Claude Code is waiting for input';
+      statusItem.backgroundColor = undefined;
+      statusItem.show();
+    } else {
+      statusItem.hide();
     }
-    return;
+  } else {
+    const first = pending[0];
+    statusItem.text = pending.length === 1
+      ? '$(bell) Claude: ' + String(first.ev.tool_name || 'permission')
+      : '$(bell) Claude: ' + pending.length + ' pending';
+    statusItem.tooltip = pending
+      .map((p) => truncate(p.ev.detail || p.ev.message, 120) || 'permission prompt')
+      .join('\n');
+    statusItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+    statusItem.show();
   }
 
-  if (ev.type === 'notify') {
-    if (claudeIsDead(ev)) {
-      pendingEvent = null;
-      hideStatus();
-      return;
+  for (const entry of pending) {
+    if (notifiedTs.get(entry.key) !== eventTs(entry.ev)) {
+      notifiedTs.set(entry.key, eventTs(entry.ev));
+      showPermissionNotification(entry);
     }
-    pendingEvent = null;
-    showStatus(
-      '$(watch) Claude is waiting',
-      false,
-      truncate(ev.message, 200) || 'Claude Code is waiting for input'
-    );
   }
 }
 
-function showPermissionNotification(ev) {
-  const ts = eventTs(ev);
+function describe(ev) {
   const toolName = String(ev.tool_name || 'a tool');
   const detail = truncate(ev.detail || ev.message, DETAIL_MAX);
-  const message =
-    'Claude needs permission: ' + toolName + (detail ? ' — ' + detail : '');
+  const project = ev.cwd ? path.basename(String(ev.cwd)) : '';
+  return { toolName, detail, project };
+}
+
+function showPermissionNotification(entry) {
+  const ts = eventTs(entry.ev);
+  const { toolName, detail, project } = describe(entry.ev);
+  const message = 'Claude needs permission: ' + toolName
+    + (detail ? ' — ' + detail : '')
+    + (project ? '  (' + project + ')' : '');
 
   Promise.resolve(
     vscode.window.showWarningMessage(message, 'Allow', 'Deny', 'Dismiss')
@@ -175,12 +312,12 @@ function showPermissionNotification(ev) {
 
       // The click may arrive long after the notification appeared. Re-read
       // the event file and only act if it is still the exact same event.
-      const current = readEventFile(watchedPath || resolveEventFile());
+      const current = readEventFile(entry.filePath);
       if (
         !current ||
         current.type !== 'permission' ||
         eventTs(current) !== ts ||
-        eventTs(current) === lastHandledTs
+        eventTs(current) === handledTs.get(entry.key)
       ) {
         vscode.window.showInformationMessage(
           'The Button: that Claude prompt is no longer pending.'
@@ -188,10 +325,9 @@ function showPermissionNotification(ev) {
         return undefined;
       }
 
-      if (choice === 'Allow') return respond(current, ENTER);
-      if (choice === 'Deny') return respond(current, ESCAPE);
-      markHandled(eventTs(current)); // Dismiss: hide locally, answer in terminal yourself
-      return undefined;
+      if (choice === 'Allow') return respond(entry.key, entry.filePath, current, true);
+      if (choice === 'Deny') return respond(entry.key, entry.filePath, current, false);
+      return dismiss(entry.key, entry.filePath, current); // hide locally
     })
     .then(undefined, (err) => {
       console.error('The Button: notification handling failed:', err);
@@ -199,7 +335,57 @@ function showPermissionNotification(ev) {
 }
 
 // ---------------------------------------------------------------------------
-// Terminal targeting + answering
+// Answering
+// ---------------------------------------------------------------------------
+
+async function respond(key, filePath, ev, allow) {
+  handledTs.set(key, eventTs(ev));
+  if (isDecide(ev)) {
+    try {
+      writeAnswer(ev.answer_path, allow
+        ? { behavior: 'allow' }
+        : { behavior: 'deny', message: 'Denied by the user via The Button (VS Code).' });
+    } catch (err) {
+      handledTs.delete(key);
+      vscode.window.showErrorMessage(
+        "The Button: couldn't write the answer file: " + (err && err.message)
+      );
+      return;
+    }
+    // The hook deletes its event file once the decision is delivered. If it
+    // instead flipped to keystroke mode (timed out a beat before our answer),
+    // deliver the intent by keystroke.
+    const timer = setTimeout(() => {
+      pendingTimers.delete(timer);
+      const current = readEventFile(filePath);
+      if (current && current.mode === 'keystroke' && eventTs(current) === eventTs(ev)) {
+        respondKeystroke(current, allow).catch((err) =>
+          console.error('The Button: keystroke fallback failed:', err));
+      }
+    }, 1200);
+    pendingTimers.add(timer);
+    updateUI();
+    return;
+  }
+  // Keystroke mode: only stay "handled" if delivery actually happened, else
+  // the prompt would be filtered out forever with the dialog still live.
+  const delivered = await respondKeystroke(ev, allow);
+  if (!delivered) handledTs.delete(key);
+  updateUI();
+}
+
+/** ✕ / Dismiss: hide locally; a decide prompt is first handed back to the
+ * native dialog so it stays answerable in the terminal. */
+function dismiss(key, filePath, ev) {
+  if (isDecide(ev)) {
+    try { writeAnswer(ev.answer_path, { behavior: 'ask' }); } catch (_e) { /* best effort */ }
+  }
+  handledTs.set(key, eventTs(ev));
+  updateUI();
+}
+
+// ---------------------------------------------------------------------------
+// Keystroke fallback: terminal targeting (unchanged from v0.1)
 // ---------------------------------------------------------------------------
 
 /**
@@ -259,8 +445,12 @@ async function findClaudeTerminal(ev) {
     if (matches.length > 1) return null; // ambiguous: never guess
   }
 
-  // (c) exactly one terminal exists
-  if (terminals.length === 1) return terminals[0];
+  // (c) exactly one terminal — ONLY when there was no routing evidence at
+  // all. If ancestors were present but matched nothing, claude is provably not
+  // in a terminal we can identify (e.g. it's in iTerm, or behind tmux which
+  // breaks the ppid chain); guessing could fire a staged command into the
+  // wrong terminal, so refuse and let the caller tell the user.
+  if (terminals.length === 1 && ancestors.length === 0) return terminals[0];
 
   return null;
 }
@@ -273,8 +463,8 @@ function normalizeDir(p) {
   return out;
 }
 
-/** Send the answer to the claude terminal in the background. */
-async function respond(ev, text) {
+/** Returns true only if the answer was actually sent to a terminal. */
+async function respondKeystroke(ev, allow) {
   let terminal = null;
   try {
     terminal = await findClaudeTerminal(ev);
@@ -283,51 +473,70 @@ async function respond(ev, text) {
   }
   if (!terminal) {
     vscode.window.showErrorMessage(
-      "The Button: couldn't identify the Claude terminal."
+      "The Button: couldn't identify the Claude terminal \u2014 answer it in the terminal."
     );
-    return;
+    return false;
   }
-  // No newline appended: "\r" itself is the Enter, "\u001b" is the Esc.
-  terminal.sendText(text, false);
-  // The hooks / macOS app own the event file — we only remember the ts.
-  markHandled(eventTs(ev));
+  try {
+    // No newline appended: "\r" itself is the Enter, the ESC control char is the Esc.
+    terminal.sendText(allow ? ENTER : ESCAPE, false);
+    return true;
+  } catch (err) {
+    console.error('The Button: sendText failed:', err);
+    vscode.window.showErrorMessage(
+      "The Button: couldn't send to the Claude terminal \u2014 answer it there."
+    );
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
-async function commandAnswer(text) {
-  const ev = pendingEvent;
-  if (!ev) {
-    vscode.window.showInformationMessage(
-      'The Button: no Claude prompt is pending.'
-    );
-    return;
+async function pickPending(placeHolder) {
+  const pending = pendingPermissions();
+  if (pending.length === 0) {
+    vscode.window.showInformationMessage('The Button: no Claude prompt is pending.');
+    return null;
   }
-  const current = readEventFile(watchedPath || resolveEventFile());
+  if (pending.length === 1) return pending[0];
+  const items = pending.map((entry) => {
+    const { toolName, detail, project } = describe(entry.ev);
+    const age = Math.max(0, Math.round(Date.now() / 1000 - eventTs(entry.ev)));
+    return {
+      label: '$(shield) ' + toolName + (detail ? ' — ' + detail : ''),
+      description: (project ? project + ' · ' : '') + age + 's',
+      entry,
+    };
+  });
+  const picked = await vscode.window.showQuickPick(items, { placeHolder });
+  return picked ? picked.entry : null;
+}
+
+async function commandAnswer(allow) {
+  const entry = await pickPending(allow ? 'Allow which prompt?' : 'Deny which prompt?');
+  if (!entry) return;
+  const current = readEventFile(entry.filePath);
   if (
     !current ||
     current.type !== 'permission' ||
-    eventTs(current) !== eventTs(ev) ||
-    eventTs(current) === lastHandledTs
+    eventTs(current) !== eventTs(entry.ev) ||
+    eventTs(current) === handledTs.get(entry.key)
   ) {
     vscode.window.showInformationMessage(
       'The Button: that Claude prompt is no longer pending.'
     );
     return;
   }
-  await respond(current, text);
+  await respond(entry.key, entry.filePath, current, allow);
 }
 
-function commandDismiss() {
-  if (!pendingEvent) {
-    vscode.window.showInformationMessage(
-      'The Button: no Claude prompt is pending.'
-    );
-    return;
-  }
-  markHandled(eventTs(pendingEvent));
+async function commandDismiss() {
+  const entry = await pickPending('Dismiss which prompt?');
+  if (!entry) return;
+  const current = readEventFile(entry.filePath) || entry.ev;
+  dismiss(entry.key, entry.filePath, current);
 }
 
 // ---------------------------------------------------------------------------
@@ -335,12 +544,14 @@ function commandDismiss() {
 // ---------------------------------------------------------------------------
 
 /**
- * Exact JS mirror of install.sh's ensure():
+ * Mirror of install.sh's ensure():
  *   - command string: python3 "$HOME/.claude/the_button/hook.py" <kind>
  *   - if any existing hook command mentions "the_button/hook.py", rewrite it
  *     in place and stop; otherwise append a new entry.
+ *   - permreq gets an explicit 600s timeout: the hook may block while the
+ *     panel decides, and the default must never kill it mid-wait.
  */
-function ensureHook(hooks, event, kind) {
+function ensureHook(hooks, event, kind, timeoutSeconds) {
   const cmd = 'python3 "$HOME/.claude/the_button/hook.py" ' + kind;
   if (!Array.isArray(hooks[event])) hooks[event] = [];
   const entries = hooks[event];
@@ -357,11 +568,15 @@ function ensureHook(hooks, event, kind) {
         h.command.includes('the_button/hook.py')
       ) {
         h.command = cmd;
+        if (timeoutSeconds) h.timeout = timeoutSeconds;
+        else delete h.timeout;
         return;
       }
     }
   }
-  entries.push({ hooks: [{ type: 'command', command: cmd }] });
+  const hook = { type: 'command', command: cmd };
+  if (timeoutSeconds) hook.timeout = timeoutSeconds;
+  entries.push({ hooks: [hook] });
 }
 
 /**
@@ -395,7 +610,7 @@ function findRepoHookPy() {
 async function installHooks() {
   if (process.platform === 'win32') {
     vscode.window.showWarningMessage(
-      'The Button: hook installation is macOS/Linux only for now (hook.py uses `ps`).'
+      'The Button: hook installation is macOS/Linux only for now (hook.py uses `ps` and POSIX file locks).'
     );
     return;
   }
@@ -460,7 +675,7 @@ async function installHooks() {
   const hooks = settings.hooks;
 
   // Same events + kinds as install.sh.
-  ensureHook(hooks, 'PermissionRequest', 'permreq');
+  ensureHook(hooks, 'PermissionRequest', 'permreq', 600);
   ensureHook(hooks, 'PreToolUse', 'pretool');
   ensureHook(hooks, 'Notification', 'notify');
   for (const event of [
@@ -473,7 +688,11 @@ async function installHooks() {
     ensureHook(hooks, event, 'clear');
   }
 
-  fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+  // Atomic write: settings.json is the single most valuable Claude Code file;
+  // a truncated write (ENOSPC/crash) would break every hook and permission.
+  const settingsTmp = settingsPath + '.tb-' + process.pid + '.tmp';
+  fs.writeFileSync(settingsTmp, JSON.stringify(settings, null, 2));
+  fs.renameSync(settingsTmp, settingsPath);
   vscode.window.showInformationMessage(
     'The Button: hooks installed in ' +
       settingsPath +
@@ -484,37 +703,8 @@ async function installHooks() {
 }
 
 // ---------------------------------------------------------------------------
-// File watching + activation
+// Activation
 // ---------------------------------------------------------------------------
-
-function onFileChange() {
-  try {
-    handleEvent(readEventFile(watchedPath || resolveEventFile()));
-  } catch (err) {
-    console.error('The Button: event handling failed:', err);
-  }
-}
-
-function setupWatch() {
-  const target = resolveEventFile();
-  if (watchedPath === target) return;
-  if (watchedPath) {
-    try {
-      fs.unwatchFile(watchedPath, onFileChange);
-    } catch (_e) {
-      /* ignore */
-    }
-  }
-  watchedPath = target;
-  try {
-    // fs.watchFile is stat-polling: it works even while the file does not
-    // exist yet and survives the atomic tempfile+rename writes hook.py does.
-    fs.watchFile(target, { interval: POLL_INTERVAL_MS }, onFileChange);
-  } catch (err) {
-    console.error('The Button: could not watch ' + target + ':', err);
-  }
-  onFileChange(); // initial read
-}
 
 function activate(context) {
   statusItem = vscode.window.createStatusBarItem(
@@ -525,17 +715,19 @@ function activate(context) {
 
   context.subscriptions.push(
     vscode.commands.registerCommand('theButton.allow', () =>
-      commandAnswer(ENTER).catch((err) =>
+      commandAnswer(true).catch((err) =>
         console.error('The Button: allow failed:', err)
       )
     ),
     vscode.commands.registerCommand('theButton.deny', () =>
-      commandAnswer(ESCAPE).catch((err) =>
+      commandAnswer(false).catch((err) =>
         console.error('The Button: deny failed:', err)
       )
     ),
     vscode.commands.registerCommand('theButton.dismiss', () =>
-      commandDismiss()
+      commandDismiss().catch((err) =>
+        console.error('The Button: dismiss failed:', err)
+      )
     ),
     vscode.commands.registerCommand('theButton.installHooks', () =>
       installHooks().catch((err) => {
@@ -544,24 +736,22 @@ function activate(context) {
           'The Button: hook installation failed: ' + (err && err.message)
         );
       })
-    ),
-    vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration('theButton.eventFile')) setupWatch();
-    })
+    )
   );
 
-  setupWatch();
+  pollTimer = setInterval(() => {
+    try { scan(); } catch (err) { console.error('The Button: scan failed:', err); }
+  }, POLL_INTERVAL_MS);
+  heartbeatTimer = setInterval(beat, HEARTBEAT_MS);
+  beat();
+  scan();
 }
 
 function deactivate() {
-  if (watchedPath) {
-    try {
-      fs.unwatchFile(watchedPath, onFileChange);
-    } catch (_e) {
-      /* ignore */
-    }
-    watchedPath = null;
-  }
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  for (const t of pendingTimers) clearTimeout(t);
+  pendingTimers.clear();
+  stopHeartbeat();
 }
 
 module.exports = { activate, deactivate };
