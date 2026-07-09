@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.2.1 — 2026-07-09
+
+Cards stay answerable; hook fixes now reach installed users automatically.
+
+- **Fixed (app):** a prompt's floating card could be silently downgraded to a
+  bare Allow/Deny card — losing its ▾ Always-allow / Deny-with-note options — or
+  retired for good, after you focused the session's editor/terminal window and
+  switched away. A decide card now keeps its full options no matter how often
+  you glance at the session: the card simply hides while that window is
+  frontmost and returns unchanged when you look away. ✕ still hands the prompt
+  back to the terminal.
+- **Fixed (app):** the card no longer flickers around focus changes — it starts
+  hidden when its prompt arrives while you're already on the session, appears
+  the instant you switch away, and drops the instant you switch back (no
+  fade-out lingering over the window, no one-frame flash while the accessibility
+  probe settles).
+- **hook.py v3:** a decide card no longer lingers (up to the 10-minute hook
+  window) after its tool was approved without touching the panel — auto-accept
+  mode, an allow-rule, or an agent. PostToolUse now retires that tool's own card
+  even while its hook is still blocking, and the freed hook exits cleanly instead
+  of resurrecting the card as a keystroke prompt. A parallel prompt you're still
+  deciding is untouched. PreToolUse also clears a session's answered
+  keystroke-mode events immediately (instead of waiting for PostToolUse), so a
+  fallback card can't linger and send a stray keystroke into a running turn.
+- **Extension:** on activation, an already-installed
+  `~/.claude/the_button/hook.py` is auto-refreshed when the bundled copy is
+  newer (compared via the new `HOOK_VERSION` stamp) — future hook fixes ship
+  with normal extension auto-updates, no re-running "Install Claude Code
+  Hooks". Never installs unsolicited.
+
 ## 0.2.0 — 2026-07-07
 
 Decide mode + multi-session support.

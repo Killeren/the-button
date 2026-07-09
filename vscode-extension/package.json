@@ -3,7 +3,7 @@
   "displayName": "The Button — Claude Code Approvals",
   "description": "Answer Claude Code permission prompts from inside VS Code, in the background — the cross-platform companion to The Button floating panel.",
   "publisher": "Killeren",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "license": "MIT",
   "icon": "icon.png",
   "repository": {

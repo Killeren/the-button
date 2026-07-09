@@ -14,6 +14,8 @@ final class FrontmostGate {
     private var cache: [String: GateState] = [:]
     private var probing = Set<String>()
     private var lastFrontPid: pid_t = -1
+    private var lastFrontChange = Date.distantPast
+    private var lastLookingAt = Date.distantPast
     var forceShowUntil: [String: Date] = [:]   // fileKey -> deadline (menu reveal)
 
     func state(for event: ButtonEvent, now: Date) -> GateState {
@@ -28,6 +30,7 @@ final class FrontmostGate {
 
         if lastFrontPid != front.processIdentifier {
             lastFrontPid = front.processIdentifier
+            lastFrontChange = now
             cache.removeAll()
         }
         // Host frontmost but we can't tell windows apart: the old behavior
@@ -55,7 +58,22 @@ final class FrontmostGate {
                 }
             }
         }
-        return cache[key] ?? .unknown
+        let resolved = cache[key] ?? .unknown
+        if resolved == .lookingAt { lastLookingAt = now }
+        // The focused-window probe blips to .away for a beat or two — just after
+        // the host becomes frontmost (before it settles on the real window), and
+        // occasionally mid-session on a title change. Taken at face value that
+        // flashes a just-hidden card back over the session. Swallow a lone .away
+        // that lands within 0.7s of the host gaining focus OR of a confirmed
+        // "looking" reading; a genuinely unfocused sibling window still surfaces
+        // its card once .away persists past that window. Switching to a whole
+        // other app doesn't come through here — it returns .away above at once.
+        if resolved == .away,
+           now.timeIntervalSince(lastFrontChange) < 0.7
+            || now.timeIntervalSince(lastLookingAt) < 0.7 {
+            return .lookingAt
+        }
+        return resolved
     }
 }
 
@@ -112,7 +130,6 @@ final class PanelController: NSObject, NSWindowDelegate {
     private let footer = FooterView()
     private var cards: [String: PromptCardView] = [:]
     private var removing = Set<String>()
-    private var gateDebounce: [String: (target: Bool, ticks: Int)] = [:]
     // Refcount, not a bool: overlapping frame animations must all finish before
     // windowDidMove is allowed to re-derive the saved position, or a mid-flight
     // frame from animation B gets written while A's completion clears the flag.
@@ -193,7 +210,6 @@ final class PanelController: NSObject, NSWindowDelegate {
                 card.removeFromSuperview()
                 self.cards.removeValue(forKey: key)
                 self.removing.remove(key)
-                self.gateDebounce.removeValue(forKey: key)
                 self.relayout(animated: true)
             }
         }
@@ -212,25 +228,29 @@ final class PanelController: NSObject, NSWindowDelegate {
                 cards[event.fileKey] = card
                 stack.insertArrangedSubview(card, at: min(index, max(0, stack.arrangedSubviews.count - 1)))
                 card.widthAnchor.constraint(equalToConstant: Metrics.panelWidth).isActive = true
-                animateIn(card)
+                // Born hidden if the gate already wants it hidden (the user is
+                // looking at the session): otherwise the card flashes in for a
+                // tick before the debounced gate loop below can hide it. A card
+                // that should show still animates in normally.
+                if gateHidden(event) {
+                    card.isHidden = true
+                } else {
+                    animateIn(card)
+                }
                 layoutChanged = true
             }
         }
 
-        // Gate hiding, debounced 2 ticks (0.5s) against AX probe flapping.
+        // Gate transitions are immediate both ways: hide the instant you focus
+        // the session so a card never lingers over it, show the instant you
+        // leave so a pending prompt appears without a beat's delay. The debounce
+        // that used to live here is gone — FrontmostGate now swallows the AX
+        // probe's transient .away blips at the source, so the raw gate reading is
+        // already stable enough to act on every tick.
         for (key, card) in cards {
             guard let event = target.first(where: { $0.fileKey == key }) else { continue }
             let wantHidden = gateHidden(event)
-            if card.isHidden == wantHidden {
-                gateDebounce.removeValue(forKey: key)
-                continue
-            }
-            var entry = gateDebounce[key] ?? (target: wantHidden, ticks: 0)
-            if entry.target != wantHidden { entry = (target: wantHidden, ticks: 0) }
-            entry.ticks += 1
-            gateDebounce[key] = entry
-            if entry.ticks >= 2 {
-                gateDebounce.removeValue(forKey: key)
+            if card.isHidden != wantHidden {
                 card.isHidden = wantHidden
                 layoutChanged = true
             }
@@ -239,7 +259,36 @@ final class PanelController: NSObject, NSWindowDelegate {
         footer.setCount(overflow)
 
         let anyVisible = cards.values.contains { !$0.isHidden }
-        setVisible(anyVisible && !paused)
+        let wantVisible = anyVisible && !paused
+        // Cards still exist but all hidden ⇒ the panel is going down because you
+        // focused the session (gate), not because a prompt was answered. Drop it
+        // instantly: the 0.15s fade-out is exactly the "return flash" where the
+        // panel lingers over the session for a frame. An emptied panel (answered
+        // / dismissed) keeps its graceful fade.
+        let instantHide = !wantVisible && !cards.isEmpty
+        setVisible(wantVisible, animated: !instantHide)
+        if layoutChanged { relayout(animated: isShown) }
+    }
+
+    /// Re-run only the gate over the cards already on screen — no snapshot
+    /// refresh, no new-card work. Called synchronously the instant an app
+    /// activates so the panel drops in that same callback (a full tick's file
+    /// read + AX probe is enough delay to flash it over the session for a
+    /// frame). The next poll tick reconciles everything else.
+    func reapplyGate(gateHidden: (ButtonEvent) -> Bool, paused: Bool) {
+        guard !cards.isEmpty else { return }
+        var layoutChanged = false
+        for (_, card) in cards where !card.isCelebrating {
+            let wantHidden = gateHidden(card.event)
+            if card.isHidden != wantHidden {
+                card.isHidden = wantHidden
+                layoutChanged = true
+            }
+        }
+        let anyVisible = cards.values.contains { !$0.isHidden }
+        let wantVisible = anyVisible && !paused
+        let instantHide = !wantVisible && !cards.isEmpty
+        setVisible(wantVisible, animated: !instantHide)
         if layoutChanged { relayout(animated: isShown) }
     }
 
@@ -375,7 +424,7 @@ final class PanelController: NSObject, NSWindowDelegate {
         }
     }
 
-    private func setVisible(_ visible: Bool) {
+    private func setVisible(_ visible: Bool, animated: Bool = true) {
         guard visible != isShown else { return }
         isShown = visible
         if visible {
@@ -387,6 +436,8 @@ final class PanelController: NSObject, NSWindowDelegate {
                 ctx.duration = Anim.dur(0.18)
                 panel.animator().alphaValue = 1
             }
+        } else if !animated || Anim.reduceMotion {
+            panel.orderOut(nil)
         } else {
             NSAnimationContext.runAnimationGroup({ ctx in
                 ctx.duration = Anim.dur(0.15)

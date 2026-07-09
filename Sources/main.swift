@@ -96,6 +96,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         RunLoop.main.add(t, forMode: .common)
         timer = t
         tick()
+
+        // Re-evaluate the gate the instant the frontmost app changes instead of
+        // waiting up to a 0.25s poll: leaving the session shows its card without
+        // a lag, and returning hides it before it can flash.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(appActivated),
+            name: NSWorkspace.didActivateApplicationNotification, object: nil)
+    }
+
+    /// Frontmost app just changed. Drop/raise the panel synchronously here —
+    /// don't route through tick(), whose file refresh + probe is enough latency
+    /// to flash the panel over a session you only now refocused.
+    @objc func appActivated() {
+        guard !isTest else { return }
+        let now = Date()
+        panelController.reapplyGate(
+            gateHidden: { [weak self] event in self?.gateHidden(event, now: now) ?? false },
+            paused: paused)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -116,7 +134,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         gate.forceShowUntil = gate.forceShowUntil.filter { liveKeys.contains($0.key) && $0.value > now }
 
         if !isTest {
-            processDecideReleases(snap: snap, now: now)
             checkAwaiting(snap: snap, now: now)
         }
         soundForNewCards(snap: snap)
@@ -130,30 +147,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusController.update(count: snap.permissions.count, paused: paused)
     }
 
+    /// A decide card stays a full decide card even while the user is looking at
+    /// the session: hiding it (gate) is enough — we never downgrade it to a
+    /// keystroke prompt behind the user's back, so its ▾ extras survive a glance
+    /// at the editor and back. The hook keeps blocking until answered on the
+    /// card, dismissed with ✕ (which hands it to the terminal), or its own
+    /// decide window times out.
     func gateHidden(_ event: ButtonEvent, now: Date) -> Bool {
         if isTest { return false }
         return gate.state(for: event, now: now) != .away
-    }
-
-    /// The user focused the session's window while a decide hook is waiting:
-    /// hand the prompt to the native dialog (the hook flips to keystroke mode
-    /// and the card gate-hides). Runs over ALL pending prompts, visible or not.
-    func processDecideReleases(snap: EventStore.Snapshot, now: Date) {
-        for event in snap.permissions where event.isDecide {
-            let key = event.fileKey
-            guard !releasedAsk.contains(key), awaitingDecide[key] == nil else { continue }
-            if gate.state(for: event, now: now) == .lookingAt {
-                if DecideAnswer.write(DecideAnswer.ask, for: event) {
-                    releasedAsk.insert(key)
-                    // The native dialog now owns this prompt and the user is
-                    // already at the terminal — retire the card so it can't
-                    // later re-appear as a keystroke card and type into a
-                    // running turn. They answer it in the terminal.
-                    store.markHandled(event)
-                    dbg("released \(key) to native dialog (user is looking)")
-                }
-            }
-        }
     }
 
     /// Confirm decide answers: the hook deletes its event file after emitting

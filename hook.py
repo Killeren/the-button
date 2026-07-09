@@ -42,6 +42,10 @@ import tempfile
 import time
 from contextlib import contextmanager
 
+# Bump on every hook.py change. Installers (VS Code extension, install.sh)
+# compare this against an installed copy and only overwrite older ones.
+HOOK_VERSION = 3
+
 STATE_DIR = os.path.expanduser("~/.claude/the_button")
 EVENTS_DIR = os.path.join(STATE_DIR, "events")
 ANSWERS_DIR = os.path.join(STATE_DIR, "answers")
@@ -361,7 +365,7 @@ def emit_decision(answer, event):
     }}))
 
 
-def wait_for_answer(apath, window, claude_pid):
+def wait_for_answer(apath, window, claude_pid, epath):
     """Poll the answer file until an answer, a fallback condition, or death of
     our claude process. Returns a dict answer, "fallback", or "orphan". Uses a
     monotonic deadline so an NTP step can't extend the block past the hook
@@ -376,6 +380,12 @@ def wait_for_answer(apath, window, claude_pid):
         now = time.monotonic()
         if now - last_check >= RECHECK_EVERY:
             last_check = now
+            # Our event file is gone: PostToolUse cleared it because the tool it
+            # gated already ran (approved without touching the panel — auto-accept
+            # mode, an allow-rule, an agent). The prompt is moot; exit as orphan
+            # so the tail doesn't resurrect it as a keystroke card.
+            if not os.path.exists(epath):
+                return "orphan"
             # claude gone (reparented from the import-time ancestor, or the
             # recorded claude pid is dead): nobody is waiting for us.
             if os.getppid() != START_PPID or (claude_pid and not pid_alive(claude_pid)):
@@ -431,7 +441,7 @@ def do_permreq(event, session):
     with state_lock():
         write_json(epath, event)
 
-    answer = wait_for_answer(apath, window, event.get("claude_pid", 0))
+    answer = wait_for_answer(apath, window, event.get("claude_pid", 0), epath)
 
     if isinstance(answer, dict) and answer.get("behavior") in ("allow", "deny"):
         emit_decision(answer, event)
@@ -479,6 +489,24 @@ def main():
             "detail": summarize(payload.get("tool_input")),
             "ts": time.time(),
         })
+        # A tool starting means any keystroke-mode permission dialog for this
+        # session was just answered in the terminal. Clear those events right
+        # away (instead of waiting for PostToolUse) so a released card the
+        # panel re-shows can't go stale and type into the running turn. Live
+        # decide hooks own their files, same guard as the clear path.
+        if session:
+            removed = False
+            with state_lock():
+                for path in session_perm_events(session):
+                    ev = read_json(path)
+                    if (isinstance(ev, dict) and ev.get("mode") == "decide"
+                            and pid_alive(ev.get("hook_pid", 0))):
+                        continue
+                    remove_quiet(path)
+                    remove_quiet(answer_path_for(path))
+                    removed = True
+                if removed:
+                    mirror_clear(session)
         return
 
     if kind == "clear":
@@ -486,6 +514,10 @@ def main():
             remove_quiet(pending_path(session))
         if not session:
             return  # malformed payload must never clear someone's prompt
+        # Identity of the tool this PostToolUse belongs to, so we can retire its
+        # own decide card even while the hook still blocks (see below).
+        done_tool = payload.get("tool_name", "")
+        done_detail = summarize(payload.get("tool_input")) if payload.get("tool_input") else ""
         with state_lock():
             remove_quiet(notify_event_path(session))
             for path in session_perm_events(session):
@@ -493,9 +525,16 @@ def main():
                 if not isinstance(ev, dict):
                     remove_quiet(path)  # malformed: clean it up
                     continue
-                # A live decide hook owns its file: PostToolUse for a parallel
-                # tool must not dismiss a prompt that is still being decided.
-                if ev.get("mode") != "decide" or not pid_alive(ev.get("hook_pid", 0)):
+                # A live decide hook owns its file: PostToolUse for a *parallel*
+                # tool must not dismiss a prompt still being decided — UNLESS the
+                # blocked prompt is for this very tool, which just ran (approved
+                # off-panel, so the hook never got an answer and would otherwise
+                # block for its full window). Clearing the file makes that hook
+                # exit as orphan on its next re-check instead of lingering.
+                live_decide = ev.get("mode") == "decide" and pid_alive(ev.get("hook_pid", 0))
+                is_this_tool = (done_tool and ev.get("tool_name") == done_tool
+                                and ev.get("detail", "") == done_detail)
+                if not live_decide or is_this_tool:
                     remove_quiet(path)
                     remove_quiet(answer_path_for(path))  # no orphan answer left
             mirror_clear(session)

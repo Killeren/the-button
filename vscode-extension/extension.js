@@ -607,6 +607,46 @@ function findRepoHookPy() {
   return null;
 }
 
+/** HOOK_VERSION constant of a hook.py source; 0 for pre-versioned copies. */
+function hookVersionOf(text) {
+  const m = /^HOOK_VERSION\s*=\s*(\d+)/m.exec(String(text || ''));
+  return m ? parseInt(m[1], 10) : 0;
+}
+
+/**
+ * Marketplace auto-updates ship a new bundled hook-py.txt, but the copy the
+ * hooks actually run lives at ~/.claude/the_button/hook.py and was only ever
+ * written by an explicit installHooks. Refresh it on activation when the
+ * bundled hook is strictly newer, so hook fixes reach users automatically.
+ * Never installs unsolicited: does nothing unless hook.py already exists.
+ */
+function refreshInstalledHook() {
+  if (process.platform === 'win32') return;
+  const dest = path.join(os.homedir(), '.claude', 'the_button', 'hook.py');
+  let installed;
+  try {
+    installed = fs.readFileSync(dest, 'utf8');
+  } catch (_e) {
+    return; // hooks were never installed here: don't volunteer
+  }
+  let bundled;
+  try {
+    bundled = fs.readFileSync(path.join(__dirname, 'hook-py.txt'), 'utf8');
+  } catch (_e) {
+    return;
+  }
+  const bundledVersion = hookVersionOf(bundled);
+  if (bundledVersion <= hookVersionOf(installed)) return;
+  try {
+    const tmp = dest + '.tb-' + process.pid + '.tmp';
+    fs.writeFileSync(tmp, bundled);
+    fs.renameSync(tmp, dest);
+    console.log('The Button: refreshed installed hook.py to v' + bundledVersion);
+  } catch (err) {
+    console.error('The Button: hook refresh failed:', err);
+  }
+}
+
 async function installHooks() {
   if (process.platform === 'win32') {
     vscode.window.showWarningMessage(
@@ -738,6 +778,8 @@ function activate(context) {
       })
     )
   );
+
+  refreshInstalledHook();
 
   pollTimer = setInterval(() => {
     try { scan(); } catch (err) { console.error('The Button: scan failed:', err); }
